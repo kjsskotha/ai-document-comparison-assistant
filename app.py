@@ -12,7 +12,8 @@ from dotenv import load_dotenv
 from docx import Document
 
 
-# Load the API key from the local .env file
+# Load local .env when running locally.
+# On Streamlit Community Cloud, use App Settings > Secrets.
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
@@ -53,14 +54,84 @@ def extract_pdf(uploaded_file):
     return full_text, len(reader.pages)
 
 
+def parse_json_response(raw):
+    """Parse JSON and repair literal control characters inside strings."""
+    raw = (raw or "").strip()
+
+    # Remove optional Markdown code fences.
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    # Extract the JSON object if extra text surrounds it.
+    start = raw.find("{")
+    end = raw.rfind("}")
+
+    if start == -1 or end <= start:
+        raise ValueError(
+            "The AI did not return a JSON object. Please try again."
+        )
+
+    raw = raw[start:end + 1]
+
+    repaired = []
+    in_string = False
+    escaped = False
+
+    for char in raw:
+        code = ord(char)
+
+        if in_string and code < 32:
+            if char == "\n":
+                repaired.append("\\n")
+            elif char == "\r":
+                repaired.append("\\r")
+            elif char == "\t":
+                repaired.append("\\t")
+            else:
+                repaired.append(f"\\u{code:04x}")
+            continue
+
+        repaired.append(char)
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+
+    try:
+        result = json.loads("".join(repaired))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "The AI response could not be parsed as valid JSON. "
+            "Please try again."
+        ) from exc
+
+    if not isinstance(result, dict):
+        raise ValueError("The AI response was not a JSON object.")
+
+    return result
+
+
 def compare_documents(text_a, text_b):
-    """Ask Groq AI to compare two documents and return structured results."""
+    """Compare two documents using Groq AI."""
     api_key = os.getenv("GROQ_API_KEY")
+
+    # Streamlit Cloud secrets are also available through st.secrets.
+    if not api_key:
+        try:
+            api_key = st.secrets.get("GROQ_API_KEY")
+        except Exception:
+            api_key = None
 
     if not api_key:
         raise ValueError(
-            "GROQ_API_KEY is not configured. "
-            "Set it as an environment variable in your hosting settings."
+            "GROQ_API_KEY is missing. Open your app's Settings > "
+            "Secrets and configure GROQ_API_KEY."
         )
 
     client = Groq(api_key=api_key)
@@ -79,6 +150,7 @@ Every value must be a clear, useful string.
 If information is unavailable, explain that briefly.
 Do not invent facts. Distinguish actual differences from missing
 information. Use simple, professional English.
+Escape newlines correctly inside JSON strings.
 
 DOCUMENT A:
 {text_a}
@@ -94,38 +166,36 @@ DOCUMENT B:
                 "role": "system",
                 "content": (
                     "You are a careful document comparison assistant. "
-                    "Follow the requested JSON format exactly."
+                    "Return one valid JSON object with exactly the seven "
+                    "requested keys. Every value must be a string. "
+                    "Escape special characters correctly in JSON."
                 ),
             },
-            {"role": "user", "content": prompt},
+            {
+                "role": "user",
+                "content": prompt,
+            },
         ],
         temperature=0.2,
+        response_format={"type": "json_object"},
     )
 
     raw = response.choices[0].message.content or ""
-    raw = raw.strip()
+    result = parse_json_response(raw)
 
-    # Support responses wrapped in Markdown code fences.
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-
-    # Extract the JSON object if extra text is returned.
-    start = raw.find("{")
-    end = raw.rfind("}")
-
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError(
-            "The AI did not return valid JSON. Please try again."
-        )
-
-    result = json.loads(raw[start:end + 1])
-
-    # Ensure every section is available.
+    # Ensure every requested section is available.
     cleaned = {}
+
     for section in SECTIONS:
         value = result.get(section, "Not returned by the AI.")
+
         if isinstance(value, (dict, list)):
-            value = json.dumps(value, indent=2, ensure_ascii=False)
+            value = json.dumps(
+                value,
+                indent=2,
+                ensure_ascii=False,
+            )
+
         cleaned[section] = str(value)
 
     return cleaned
@@ -159,6 +229,7 @@ st.set_page_config(
 )
 
 st.title("AI Document Comparison Assistant")
+
 st.write(
     "Upload two PDF documents to compare their content, "
     "identify similarities and differences, and generate a report."
@@ -182,15 +253,15 @@ with col_b:
 
 text_a = None
 text_b = None
-pages_a = 0
-pages_b = 0
 
 if file_a is not None:
     try:
         text_a, pages_a = extract_pdf(file_a)
         st.success(f"Document A loaded: {pages_a} page(s)")
+
         with st.expander("Preview Document A text"):
             st.text(text_a[:3000])
+
     except Exception as exc:
         st.error(f"Could not read Document A: {exc}")
 
@@ -198,10 +269,13 @@ if file_b is not None:
     try:
         text_b, pages_b = extract_pdf(file_b)
         st.success(f"Document B loaded: {pages_b} page(s)")
+
         with st.expander("Preview Document B text"):
             st.text(text_b[:3000])
+
     except Exception as exc:
         st.error(f"Could not read Document B: {exc}")
+
 
 if st.button(
     "Compare Documents",
@@ -210,8 +284,10 @@ if st.button(
 ):
     if file_a is None or file_b is None:
         st.warning("Please upload both PDF documents first.")
+
     elif not text_a or not text_b:
         st.warning("Please upload two readable PDFs containing text.")
+
     else:
         try:
             with st.spinner("Analyzing both documents..."):
@@ -220,10 +296,12 @@ if st.button(
             st.session_state["comparison_results"] = results
             st.session_state["document_a_name"] = file_a.name
             st.session_state["document_b_name"] = file_b.name
+
             st.success("Document comparison completed!")
 
         except Exception as exc:
             st.error(f"Comparison failed: {exc}")
+
 
 if "comparison_results" in st.session_state:
     results = st.session_state["comparison_results"]
@@ -234,7 +312,9 @@ if "comparison_results" in st.session_state:
 
     for tab, section in zip(tabs, SECTIONS):
         with tab:
-            st.markdown(results.get(section, "No result available."))
+            st.markdown(
+                results.get(section, "No result available.")
+            )
 
     report_bytes = create_report(
         results,
